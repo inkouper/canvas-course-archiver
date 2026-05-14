@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+canvas_archive*/
+_quiz_test/
+_quiz_pdf_probe/
+_quiz_mhtml_probe/
+_new_quiz_*/
+_new_quiz_item_probe/
+_new_quiz_item_probe_2/
+_new_quiz_iframe_mhtml_probe/
+_rubrics_probe/
+session.json
+**/session.json
