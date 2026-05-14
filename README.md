@@ -69,6 +69,14 @@ Keeping the script/repo separate from generated archive folders is recommended, 
 
 > **Windows note:** The examples below use `\` to split long commands across lines (a bash/macOS convention). On Windows, type the command on a single line or use `` ` `` for line continuation in PowerShell.
 
+> **Running from another directory:** Python must be able to find the script file. If your terminal is not in the same folder as `canvas_archive.py`, provide the full path to the script:
+>
+> ```bash
+> python "C:/path/to/canvas-course-archiver/canvas_archive.py" --course-url ... --apply --out-dir ./my_archive
+> ```
+>
+> Using just `python canvas_archive.py` from a different folder will fail with "can't open file" or "can't find `__main__` module" because Python looks for the script relative to your current working directory. The `--out-dir` flag controls where the archive is saved, independent of where the script lives.
+
 Run a safe inventory first:
 
 ```bash
