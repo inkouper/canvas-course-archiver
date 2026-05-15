@@ -19,8 +19,10 @@ import argparse
 import asyncio
 from datetime import datetime
 from html import escape
+import hashlib
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,12 @@ from playwright.async_api import Download, Page, async_playwright
 
 DEFAULT_OUT_DIR_PREFIX = "canvas_archive"
 ARCHIVE_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 @dataclass
@@ -98,6 +106,150 @@ def is_same_origin(url: str, cfg: Config) -> bool:
     return parsed_url.netloc == parsed_base.netloc
 
 
+IMAGE_EXTENSIONS = {
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/svg+xml": ".svg",
+    "image/webp": ".webp",
+}
+
+
+def image_extension_from_content_type(content_type: str | None) -> str:
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    return IMAGE_EXTENSIONS.get(mime, ".img")
+
+
+def is_supported_image_content_type(content_type: str | None) -> bool:
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    return mime.startswith("image/")
+
+
+def canvas_file_id_from_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    match = re.search(r"/files/(\d+)", parsed.path)
+    if match:
+        return match.group(1)
+    query = parse_qs(parsed.query)
+    for key in ("file_id", "id"):
+        if query.get(key):
+            return query[key][0]
+    return None
+
+
+async def localize_html_images(page: Page, dest: Path, cfg: Config) -> dict[str, Any]:
+    """Download Canvas-hosted content images beside an HTML snapshot and rewrite img src values."""
+    result: dict[str, Any] = {"found": 0, "saved": 0, "reused": 0, "skipped": 0, "failed": []}
+    try:
+        images = await page.evaluate(
+            """() => {
+                const scopes = [
+                    ".user_content",
+                    "[data-resource-type]",
+                    "#content",
+                    ".assignment-description",
+                    ".description"
+                ];
+                const inScope = (node) => scopes.some((selector) => node.closest(selector));
+                const nodes = Array.from(document.querySelectorAll("img")).filter(inScope);
+                const seen = new Set();
+                return nodes.map((node, index) => {
+                    const raw = node.currentSrc || node.getAttribute("src") || "";
+                    if (!raw || raw.startsWith("data:") || raw.startsWith("blob:")) return null;
+                    const absolute = new URL(raw, document.baseURI).href;
+                    const url = new URL(absolute);
+                    const sameOrigin = url.origin === location.origin;
+                    const isCanvasFile = /\\/files\\/\\d+/.test(url.pathname) || /\\/file_ref\\//.test(url.pathname);
+                    if (!sameOrigin && !isCanvasFile) return null;
+                    if (seen.has(absolute)) return null;
+                    seen.add(absolute);
+                    return {
+                        index,
+                        raw,
+                        absolute,
+                        api: node.getAttribute("data-api-endpoint") || ""
+                    };
+                }).filter(Boolean);
+            }"""
+        )
+    except Exception as exc:
+        result["failed"].append({"url": "", "error": f"image scan failed: {exc}"})
+        return result
+
+    result["found"] = len(images)
+    if not images:
+        return result
+
+    assets_dir = dest.with_suffix("")
+    assets_dir = assets_dir.parent / f"{assets_dir.name}_assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    rewrites: dict[str, str] = {}
+    local_by_url: dict[str, str] = {}
+    used_names: set[str] = set()
+    for image in images:
+        url = image["absolute"]
+        try:
+            if url in local_by_url:
+                rewrites[image["raw"]] = local_by_url[url]
+                rewrites[url] = local_by_url[url]
+                result["reused"] += 1
+                continue
+
+            response = await page.context.request.get(url, timeout=cfg.timeout_ms)
+            if not response.ok:
+                result["failed"].append({"url": url, "error": f"HTTP {response.status}"})
+                continue
+            content_type = response.headers.get("content-type")
+            if not is_supported_image_content_type(content_type):
+                result["failed"].append({"url": url, "error": f"Unsupported content type: {content_type or 'unknown'}"})
+                continue
+            body = await response.body()
+            ext = image_extension_from_content_type(content_type)
+            file_id = canvas_file_id_from_url(image.get("api") or url)
+            digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+            filename = f"image_{file_id or digest}{ext}"
+            while filename.lower() in used_names:
+                filename = f"{Path(filename).stem}_{digest}{ext}"
+            used_names.add(filename.lower())
+            asset_path = assets_dir / filename
+            asset_path.write_bytes(body)
+            local_path = f"{assets_dir.name}/{filename}"
+            local_by_url[url] = local_path
+            rewrites[image["raw"]] = local_path
+            rewrites[url] = local_path
+            result["saved"] += 1
+        except Exception as exc:
+            result["failed"].append({"url": url, "error": str(exc)})
+
+    if rewrites:
+        await page.evaluate(
+            """rewrites => {
+                const scopes = [
+                    ".user_content",
+                    "[data-resource-type]",
+                    "#content",
+                    ".assignment-description",
+                    ".description"
+                ];
+                const inScope = (node) => scopes.some((selector) => node.closest(selector));
+                for (const node of Array.from(document.querySelectorAll("img")).filter(inScope)) {
+                    const raw = node.currentSrc || node.getAttribute("src") || "";
+                    const absolute = raw ? new URL(raw, document.baseURI).href : "";
+                    const local = rewrites[raw] || rewrites[absolute];
+                    if (!local) continue;
+                    node.setAttribute("src", local);
+                    node.removeAttribute("srcset");
+                    node.removeAttribute("data-api-endpoint");
+                    node.removeAttribute("data-api-returntype");
+                }
+            }""",
+            rewrites,
+        )
+
+    return result
+
+
 def quiz_kind_from_url(url: str, cfg: Config) -> str | None:
     """Classify a resolved top-level Canvas quiz URL."""
     parsed = urlparse(url)
@@ -134,6 +286,20 @@ def classic_quiz_questions_url(url: str, cfg: Config) -> str:
     return parsed._replace(path=f"{clean_path}/edit", query="", fragment="tab-questions").geturl()
 
 
+def classic_quiz_edit_url(url: str, cfg: Config) -> str:
+    """Build the Canvas Classic Quiz edit URL without relying on a tab fragment."""
+    parsed = urlparse(url)
+    match = re.search(r"/courses/(\d+)/quizzes/(\d+)", parsed.path)
+    if match:
+        course_id, quiz_id = match.groups()
+        return f"{cfg.base_url}/courses/{course_id}/quizzes/{quiz_id}/edit"
+
+    clean_path = parsed.path.rstrip("/")
+    if clean_path.endswith("/edit"):
+        return parsed._replace(path=clean_path, query="", fragment="").geturl()
+    return parsed._replace(path=f"{clean_path}/edit", query="", fragment="").geturl()
+
+
 def with_query_param(url: str, key: str, value: Any) -> str:
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
@@ -166,10 +332,19 @@ def parse_course_url(course_url: str) -> tuple[str, str]:
     return f"{parsed.scheme}://{parsed.netloc}", match.group(1)
 
 
+def archive_timestamp() -> str:
+    """Return a timestamp safe for archive folder names."""
+    return datetime.now().strftime(ARCHIVE_TIMESTAMP_FORMAT)
+
+
 def default_archive_dir(course_id: str) -> Path:
     """Return a timestamped default archive folder for repeatable reruns."""
-    timestamp = datetime.now().strftime(ARCHIVE_TIMESTAMP_FORMAT)
-    return Path(f"{DEFAULT_OUT_DIR_PREFIX}_{course_id}_{timestamp}")
+    return Path(f"{DEFAULT_OUT_DIR_PREFIX}_{course_id}_{archive_timestamp()}")
+
+
+def archive_dir_from_out_dir(out_dir: Path) -> Path:
+    """Treat --out-dir as a parent folder and create a timestamped archive inside it."""
+    return out_dir / f"course_archive_{archive_timestamp()}"
 
 
 async def wait_for_sso(page: Page, cfg: Config) -> None:
@@ -423,7 +598,8 @@ async def get_announcements_from_rendered_page(page: Page, cfg: Config) -> list[
 
 
 async def get_announcements_inventory(page: Page, cfg: Config) -> list[dict[str, Any]]:
-    """Fetch course announcements, falling back to links on the Announcements page."""
+    """Fetch course announcements and merge with links on the Announcements page."""
+    api_announcements: list[dict[str, Any]] = []
     try:
         announcements = await api_get_all(
             page,
@@ -448,26 +624,169 @@ async def get_announcements_inventory(page: Page, cfg: Config) -> list[dict[str,
                     "delayed_post_at": raw.get("delayed_post_at"),
                 }
             )
-        normalized = [announcement for announcement in normalized if announcement.get("url")]
-        if normalized:
-            return normalized
-        print("Announcement API returned no rows; checking the rendered Announcements page.")
+        api_announcements = [announcement for announcement in normalized if announcement.get("url")]
+        if not api_announcements:
+            print("Announcement API returned no rows; checking the rendered Announcements page.")
     except Exception as exc:
         print(f"Announcement API inventory unavailable; falling back to rendered page: {exc}")
 
-    return await get_announcements_from_rendered_page(page, cfg)
+    rendered_announcements = await get_announcements_from_rendered_page(page, cfg)
+    if rendered_announcements and len(rendered_announcements) > len(api_announcements):
+        print(
+            f"Rendered Announcements page found {len(rendered_announcements)} links; "
+            f"API found {len(api_announcements)}."
+        )
+
+    merged: dict[str, dict[str, Any]] = {}
+    for announcement in api_announcements:
+        url = announcement.get("url")
+        if url:
+            merged[url] = announcement
+    for announcement in rendered_announcements:
+        url = announcement.get("url")
+        if url:
+            merged[url] = {**merged.get(url, {}), **announcement}
+
+    return list(merged.values())
 
 
-async def save_html(page: Page, url: str, dest: Path, cfg: Config) -> bool:
+async def save_html(
+    page: Page,
+    url: str,
+    dest: Path,
+    cfg: Config,
+    localize_images: bool = True,
+    image_report: dict[str, Any] | None = None,
+) -> bool:
     """Navigate to url and save full rendered HTML."""
     try:
-        await page.goto(url, wait_until="networkidle", timeout=cfg.timeout_ms)
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=cfg.timeout_ms)
+        except Exception:
+            await page.goto(url, wait_until="domcontentloaded", timeout=cfg.timeout_ms)
+            await page.wait_for_timeout(3000)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if localize_images:
+            image_result = await localize_html_images(page, dest, cfg)
+            if image_report is not None:
+                image_report.update(image_result)
+            if image_result["found"]:
+                print(
+                    f"    Images localized: {image_result['saved']}/{image_result['found']}"
+                    + (f" ({image_result['reused']} reused)" if image_result.get("reused") else "")
+                    + (f" ({len(image_result['failed'])} failed)" if image_result["failed"] else "")
+                )
         dest.write_text(await page.content(), encoding="utf-8")
         return True
     except Exception as exc:
         print(f"    HTML save failed: {exc}")
         return False
+
+
+def render_discussion_prompt_html(data: dict[str, Any], source_url: str) -> str:
+    """Render only the initial Canvas discussion prompt as a standalone HTML snapshot."""
+    title = data.get("title") or "Discussion prompt"
+    body_html = data.get("body_html") or "<p>Discussion prompt body was not found.</p>"
+    posted = data.get("posted_text") or ""
+    resource_id = data.get("resource_id") or ""
+    metadata = [f"Source: {escape(source_url)}"]
+    if posted:
+        metadata.append(f"Posted: {escape(posted)}")
+    if resource_id:
+        metadata.append(f"Canvas resource id: {escape(resource_id)}")
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{escape(title)}</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; line-height: 1.5; margin: 32px; color: #1f2933; }}
+    main {{ max-width: 900px; margin: 0 auto; }}
+    .source {{ color: #52606d; font-size: 13px; overflow-wrap: anywhere; }}
+    img {{ max-width: 100%; height: auto; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escape(title)}</h1>
+    <p class="source">{' | '.join(metadata)}</p>
+    <article>
+      {body_html}
+    </article>
+  </main>
+</body>
+</html>
+"""
+
+
+async def save_discussion_prompt_html(page: Page, url: str, dest: Path, cfg: Config) -> tuple[bool, dict[str, Any]]:
+    """Save only the initial discussion prompt, excluding replies/thread rendering."""
+    image_report: dict[str, Any] = {}
+    try:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=cfg.timeout_ms)
+        except Exception:
+            await page.wait_for_timeout(3000)
+
+        ready_selector = (
+            '[data-resource-type="discussion_topic.body"], '
+            '.discussion-topic-message .user_content, '
+            '[data-testid="discussion-topic-title"], '
+            '.discussion-title, '
+            'h1'
+        )
+        try:
+            await page.wait_for_selector(ready_selector, timeout=min(cfg.timeout_ms, 15000))
+        except Exception:
+            await page.wait_for_timeout(1000)
+
+        image_report.update(await localize_html_images(page, dest, cfg))
+        if image_report.get("found"):
+            print(
+                f"    Images localized: {image_report['saved']}/{image_report['found']}"
+                + (f" ({image_report['reused']} reused)" if image_report.get("reused") else "")
+                + (f" ({len(image_report['failed'])} failed)" if image_report["failed"] else "")
+            )
+
+        data = await page.evaluate(
+            """() => {
+                const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                const titleNode =
+                    document.querySelector('[data-testid="discussion-topic-title"]') ||
+                    document.querySelector('[data-testid="message_title"]') ||
+                    document.querySelector(".discussion-title") ||
+                    document.querySelector("h1");
+                const body =
+                    document.querySelector('[data-resource-type="discussion_topic.body"]') ||
+                    document.querySelector(".discussion-topic-message .user_content") ||
+                    Array.from(document.querySelectorAll(".user_content.enhanced, .user_content"))
+                        .find((node) => {
+                            const type = node.getAttribute("data-resource-type") || "";
+                            return !type.includes("reply") && clean(node.innerText || node.textContent).length > 20;
+                        });
+                const postedNode =
+                    document.querySelector("time") ||
+                    document.querySelector(".posted_at") ||
+                    document.querySelector(".discussion-pubdate");
+                return {
+                    title: clean(titleNode?.innerText || titleNode?.textContent || document.title),
+                    body_html: body ? body.innerHTML.trim() : "",
+                    body_text: body ? clean(body.innerText || body.textContent || "") : "",
+                    posted_text: clean(postedNode?.innerText || postedNode?.textContent || ""),
+                    resource_id: body ? body.getAttribute("data-resource-id") : null,
+                    resource_type: body ? body.getAttribute("data-resource-type") : null
+                };
+            }"""
+        )
+        if not data.get("body_html"):
+            data["body_html"] = "<p>Discussion prompt body was not found in the rendered page.</p>"
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(render_discussion_prompt_html(data, page.url), encoding="utf-8")
+        return True, {"image_assets": image_report, "prompt_extracted": bool(data.get("body_text"))}
+    except Exception as exc:
+        print(f"    Discussion prompt save failed: {exc}")
+        return False, {"image_assets": image_report, "error": str(exc), "prompt_extracted": False}
 
 
 async def check_view_question_details(page: Page) -> None:
@@ -480,8 +799,17 @@ async def check_view_question_details(page: Page) -> None:
     for selector in detail_selectors:
         box = page.locator(selector).first
         try:
-            if await box.count() and await box.is_visible() and not await box.is_checked():
-                await box.check()
+            if await box.count() and not await box.is_checked():
+                try:
+                    await box.check(force=True)
+                except Exception:
+                    await box.evaluate(
+                        """input => {
+                            input.checked = true;
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                        }"""
+                    )
                 await page.wait_for_timeout(1000)
                 return
         except Exception:
@@ -497,7 +825,7 @@ async def check_view_question_details(page: Page) -> None:
             if label_for:
                 box = page.locator(f"#{label_for}").first
                 if await box.count() and not await box.is_checked():
-                    await box.check()
+                    await box.check(force=True)
                     await page.wait_for_timeout(1000)
                 return
             await label.click()
@@ -505,6 +833,50 @@ async def check_view_question_details(page: Page) -> None:
             return
         except Exception:
             pass
+
+
+async def open_classic_quiz_questions_tab(page: Page, url: str, cfg: Config) -> str:
+    """Open an active Classic Quiz edit page and move to the Questions tab."""
+    target_url = classic_quiz_edit_url(url, cfg)
+    await page.goto(target_url, wait_until="domcontentloaded", timeout=cfg.timeout_ms)
+    try:
+        await page.wait_for_selector("#quiz_edit_tabs, a[href='#tab-questions']", timeout=10_000)
+    except Exception:
+        await page.wait_for_timeout(500)
+
+    tab_selectors = (
+        "#quiz_edit_tabs a[href='#tab-questions']",
+        "a[href='#tab-questions']",
+        "[role='tab']:has-text('Questions')",
+        "a:has-text('Questions')",
+        "button:has-text('Questions')",
+    )
+    for selector in tab_selectors:
+        tab = page.locator(selector).first
+        try:
+            if await tab.count():
+                await tab.click(force=True)
+                await page.wait_for_timeout(500)
+                break
+        except Exception:
+            pass
+
+    try:
+        await page.evaluate(
+            """() => {
+                if (location.hash !== '#tab-questions') {
+                    location.hash = 'tab-questions';
+                    window.dispatchEvent(new HashChangeEvent('hashchange'));
+                }
+                const tab = document.querySelector("#quiz_edit_tabs a[href='#tab-questions'], a[href='#tab-questions']");
+                if (tab) tab.click();
+            }"""
+        )
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    return page.url
 
 
 async def wait_for_classic_quiz_questions(page: Page, cfg: Config) -> None:
@@ -524,16 +896,142 @@ async def wait_for_classic_quiz_questions(page: Page, cfg: Config) -> None:
         await page.wait_for_timeout(3000)
 
 
-async def save_classic_quiz(page: Page, url: str, dest: Path, cfg: Config) -> bool:
-    """Save a Classic Quiz from the edit/questions tab with details expanded."""
-    try:
-        target_url = classic_quiz_questions_url(url, cfg)
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=cfg.timeout_ms)
+async def extract_classic_quiz_fragment(page: Page) -> dict[str, str]:
+    """Extract the useful Classic Quiz questions area for archival HTML."""
+    return await page.evaluate(
+        """() => {
+            const pick = (...selectors) => {
+                for (const selector of selectors) {
+                    const node = document.querySelector(selector);
+                    if (node) return node;
+                }
+                return document.body;
+            };
+            const title =
+                document.querySelector("h1")?.innerText?.trim() ||
+                document.querySelector("#quiz_title")?.innerText?.trim() ||
+                document.title ||
+                "Classic Quiz";
+            const content = pick("#questions", "#tab-questions", "#quiz_edit_tabs", "#content", "main", "body");
+            return { title, html: content.outerHTML, url: location.href };
+        }"""
+    )
+
+
+async def next_classic_quiz_questions_page(page: Page):
+    """Return a locator for a next pagination control on Classic Quiz questions."""
+    selectors = (
+        "a[rel='next']",
+        "a.next_page:not(.disabled)",
+        ".pagination a:has-text('Next')",
+        "a:has-text('Next')",
+        "button:has-text('Next')",
+        "a[aria-label*='Next' i]",
+        "button[aria-label*='Next' i]",
+    )
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if await locator.count() and await locator.is_visible() and await locator.is_enabled():
+                disabled = (await locator.get_attribute("aria-disabled")) or ""
+                classes = (await locator.get_attribute("class")) or ""
+                if disabled.lower() == "true" or "disabled" in classes.lower():
+                    continue
+                return locator
+        except Exception:
+            pass
+    return None
+
+
+async def collect_classic_quiz_question_pages(page: Page, cfg: Config) -> list[dict[str, str]]:
+    """Collect all paginated active Classic Quiz question pages with details expanded."""
+    fragments = []
+    seen_urls = set()
+
+    for _ in range(100):
         await wait_for_classic_quiz_questions(page, cfg)
         await check_view_question_details(page)
         await wait_for_classic_quiz_questions(page, cfg)
+
+        current_url = page.url
+        if current_url not in seen_urls:
+            fragments.append(await extract_classic_quiz_fragment(page))
+            seen_urls.add(current_url)
+
+        next_link = await next_classic_quiz_questions_page(page)
+        if not next_link:
+            break
+
+        try:
+            await next_link.click(force=True)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=cfg.timeout_ms)
+            except Exception:
+                await page.wait_for_timeout(2000)
+        except Exception:
+            break
+
+        if page.url in seen_urls:
+            break
+
+    return fragments
+
+
+def render_classic_quiz_pages_html(title: str, pages: list[dict[str, str]]) -> str:
+    """Render one or more collected Classic Quiz question pages into one archive file."""
+    sections = []
+    for idx, fragment in enumerate(pages, 1):
+        sections.append(
+            f"""
+            <section class="quiz-page">
+              <h2>Questions Page {idx}</h2>
+              <p class="source">Source: {escape(fragment.get("url") or "")}</p>
+              <div class="canvas-fragment">{fragment.get("html") or ""}</div>
+            </section>
+            """
+        )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(title)}</title>
+  <style>
+    body {{ margin: 0; font-family: Arial, Helvetica, sans-serif; color: #1f2933; background: #f6f7f9; }}
+    main {{ max-width: 1100px; margin: 0 auto; padding: 32px 24px 56px; }}
+    h1 {{ margin: 0 0 24px; font-size: 28px; line-height: 1.2; }}
+    h2 {{ margin: 0 0 8px; font-size: 20px; }}
+    .source {{ color: #52606d; font-size: 13px; overflow-wrap: anywhere; }}
+    .quiz-page {{ background: #fff; border: 1px solid #d9e2ec; border-radius: 6px; padding: 20px; margin: 18px 0; }}
+    .answer.correct_answer, .correct_answer {{ border-color: #2f855a !important; background: #f0fff4 !important; }}
+    .answer.correct_answer::before {{ content: "Correct answer"; display: inline-block; margin: 0 0 8px; color: #276749; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em; }}
+    .answer_arrow[aria-label="Correct Answer"]::after {{ content: "Correct answer"; color: #276749; font-size: 12px; font-weight: 700; margin-right: 8px; }}
+    img, video {{ max-width: 100%; height: auto; }}
+    table {{ border-collapse: collapse; max-width: 100%; }}
+    th, td {{ border: 1px solid #d9e2ec; padding: 6px 8px; }}
+    @media print {{ body {{ background: #fff; }} main {{ max-width: none; padding: 0; }} .quiz-page {{ border: 0; break-inside: avoid; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escape(title)}</h1>
+    {''.join(sections)}
+  </main>
+</body>
+</html>
+"""
+
+
+async def save_classic_quiz(page: Page, url: str, dest: Path, cfg: Config) -> bool:
+    """Save a Classic Quiz from the edit/questions tab with details expanded."""
+    try:
+        await open_classic_quiz_questions_tab(page, url, cfg)
+        pages = await collect_classic_quiz_question_pages(page, cfg)
+        if not pages:
+            pages = [await extract_classic_quiz_fragment(page)]
+        title = pages[0].get("title") or "Classic Quiz"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(await page.content(), encoding="utf-8")
+        dest.write_text(render_classic_quiz_pages_html(title, pages), encoding="utf-8")
         return True
     except Exception as exc:
         print(f"    Classic quiz save failed: {exc}")
@@ -919,10 +1417,11 @@ async def download_canvas_file(page: Page, url: str, dest: Path, cfg: Config) ->
 
 
 async def download_course_file(page: Page, file_info: dict[str, Any], cfg: Config) -> dict[str, Any]:
-    """Download a file from the Canvas Files inventory into a mirrored folder."""
-    folder_path = Path(*[sanitize(part) for part in str(file_info.get("folder_path", "course files")).split("/")])
+    """Download a file from the Canvas Files inventory into the root course files folder."""
     filename = sanitize(file_info.get("display_name") or file_info.get("filename") or f"file_{file_info.get('id')}")
-    dest = cfg.out_dir / "_course_files" / folder_path / filename
+    dest = cfg.out_dir / "_course_files" / filename
+    if dest.exists() and file_info.get("id"):
+        dest = dest.with_name(f"{dest.stem}_{file_info.get('id')}{dest.suffix}")
     result = {
         "id": file_info.get("id"),
         "display_name": file_info.get("display_name"),
@@ -991,8 +1490,12 @@ async def archive_announcements(page: Page, announcements: list[dict[str, Any]],
 
     for idx, announcement in enumerate(announcements, 1):
         title = announcement.get("title") or f"Announcement {idx}"
+        print(f"  Announcement {idx:02d}/{len(announcements)}: {title}", flush=True)
         dest = dest_dir / f"{idx:02d}_{sanitize(title)}.txt"
-        result["announcements"].append(await save_announcement_text(page, announcement, dest, cfg))
+        item_result = await save_announcement_text(page, announcement, dest, cfg)
+        result["announcements"].append(item_result)
+        if not item_result.get("body_extracted"):
+            print(f"    Announcement text fallback used: {item_result.get('error', 'body not found')}", flush=True)
 
     return result
 
@@ -1016,16 +1519,20 @@ async def save_announcement_text(page: Page, announcement: dict[str, Any], dest:
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=cfg.timeout_ms)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=cfg.timeout_ms)
-        except Exception:
-            await page.wait_for_timeout(3000)
 
         body_selector = '[data-resource-type="announcement.body"]'
+        announcement_ready_selector = (
+            f"{body_selector}, "
+            "[data-testid='message_title'], "
+            "[data-testid='discussion-topic-title'], "
+            ".discussion-title, "
+            "h1"
+        )
+        targeted_timeout = min(cfg.timeout_ms, 12000)
         try:
-            await page.wait_for_selector(body_selector, timeout=cfg.timeout_ms)
+            await page.wait_for_selector(announcement_ready_selector, timeout=targeted_timeout)
         except Exception:
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(750)
 
         extracted = await page.evaluate(
             """() => {
@@ -1249,9 +1756,24 @@ async def archive_item(page: Page, item: dict[str, Any], dest_dir: Path, idx: in
         status.update({"saved": saved, "path": str(dest)})
         return status
 
+    if itype == "discussion":
+        dest = dest_dir / f"{prefix}.html"
+        saved, discussion_report = await save_discussion_prompt_html(page, url, dest, cfg)
+        status.update({"saved": saved, "path": str(dest), "discussion_archive_mode": "prompt_only_html"})
+        if discussion_report.get("image_assets"):
+            status["image_assets"] = discussion_report["image_assets"]
+        if "prompt_extracted" in discussion_report:
+            status["prompt_extracted"] = discussion_report["prompt_extracted"]
+        if discussion_report.get("error"):
+            status["error"] = discussion_report["error"]
+        return status
+
     dest = dest_dir / f"{prefix}.html"
-    saved = await save_html(page, url, dest, cfg)
+    image_report: dict[str, Any] = {}
+    saved = await save_html(page, url, dest, cfg, image_report=image_report)
     status.update({"saved": saved, "path": str(dest)})
+    if image_report:
+        status["image_assets"] = image_report
     return status
 
 
@@ -1374,7 +1896,7 @@ async def run(cfg: Config) -> None:
             manifest["archive_results"].append(module_result)
             print()
 
-        print("Archiving announcements...")
+        print("Archiving announcements...", flush=True)
         manifest["announcements_export"] = await archive_announcements(page, announcements, cfg)
         saved_announcements = [
             item for item in manifest["announcements_export"].get("announcements", []) if item.get("saved")
@@ -1383,13 +1905,16 @@ async def run(cfg: Config) -> None:
             f"  Saved announcements index and {len(saved_announcements)}/{len(announcements)} announcements under _announcements/."
         )
 
-        print("Archiving full course Files area...")
+        print(
+            f"Archiving full course Files area ({len(files)} files) before rubric export...",
+            flush=True,
+        )
         manifest["course_file_results"] = []
         for file_idx, file_info in enumerate(files, 1):
-            print(f"  {file_idx:02d}. {file_info.get('folder_path')}/{file_info.get('display_name')}")
+            print(f"  {file_idx:03d}/{len(files):03d}. {file_info.get('display_name')}", flush=True)
             manifest["course_file_results"].append(await download_course_file(page, file_info, cfg))
 
-        print("Exporting rubrics...")
+        print("Exporting rubrics...", flush=True)
         manifest["rubrics_export"] = await export_rubrics(page, cfg)
         if manifest["rubrics_export"].get("saved"):
             print(f"  Saved rubrics to {manifest['rubrics_export']['path']}")
@@ -1413,7 +1938,8 @@ def parse_args() -> Config:
         epilog=(
             "The script can be run from any folder. If --out-dir is omitted, "
             "the timestamped archive folder is created in the current working directory. "
-            "Use --out-dir to save the archive somewhere else."
+            "If --out-dir is provided, it is treated as a parent folder and a "
+            "course_archive_<YYYYMMDD_HHMMSS> subfolder is created inside it."
         ),
     )
     target = parser.add_argument_group("course target")
@@ -1431,8 +1957,9 @@ def parse_args() -> Config:
         "--out-dir",
         type=Path,
         help=(
-            "Archive output directory. Defaults to "
-            "canvas_archive_<course_id>_<YYYYMMDD_HHMMSS> in the current working directory."
+            "Parent directory for the archive. The script creates a "
+            "course_archive_<YYYYMMDD_HHMMSS> subfolder inside it. If omitted, "
+            "defaults to canvas_archive_<course_id>_<YYYYMMDD_HHMMSS> in the current working directory."
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Inventory only; do not write archive files.")
@@ -1464,7 +1991,7 @@ def parse_args() -> Config:
         base_url = args.base_url.rstrip("/")
         course_id = args.course_id
 
-    out_dir = args.out_dir or default_archive_dir(course_id)
+    out_dir = archive_dir_from_out_dir(args.out_dir) if args.out_dir else default_archive_dir(course_id)
     return Config(
         base_url=base_url,
         course_id=course_id,
