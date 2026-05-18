@@ -1,11 +1,12 @@
 # Canvas Course Archiver
 
-Archive a Canvas course for long-term offline preservation.
+Archives a Canvas course for long-term offline preservation. 
+Uses creator (instructor / teacher) log in. Currently works as end-of-semester / end-of-year archive (not as regular snapshotting archiving).
 
-The script logs into Canvas with Playwright, inventories the course modules, saves rendered HTML snapshots for module pages and activities, localizes Canvas-hosted images used in those HTML pages, records external links, and downloads Canvas files.
+The script logs into Canvas with Playwright (a testing and automation tool), inventories the course modules, and saves rendered HTML snapshots for module pages and activities along with images used in those HTML pages.
 It also downloads the full Canvas Files area so files that are not linked directly from modules are still preserved.
 
-## Structure
+## Archive Structure
 
 - `structure.json`: module and module-item inventory from Canvas.
 - `modules_index.html`: rendered snapshot of the Canvas Modules page.
@@ -20,7 +21,7 @@ It also downloads the full Canvas Files area so files that are not linked direct
 ## Requirements
 
 - Python 3.10 or newer
-- Access to the Canvas course in a browser
+- Log in credentials to the Canvas course in a browser
 - Playwright
 
 Install dependencies:
@@ -32,24 +33,24 @@ playwright install chromium
 
 ## Where It Can Run
 
-This is a normal Python command-line script. You can run it from:
+This is a Python command-line script. You can run it from:
 
 - a terminal or command prompt;
 - VS Code, PyCharm, or another Python IDE;
 - a local Python virtual environment.
 
-The only requirements are Python 3.10 or newer, Playwright, Chromium installed with `playwright install chromium`, and network/browser access to Canvas.
-
 Because the script opens a browser for login, it works best in an environment with a visible desktop browser. Headless runs are only recommended after `session.json` has already been created by a successful login.
+
+The script can also run in an AI coding assistant environment (see "Using An AI Assistant Environment" below).
 
 ## Where to Put the Script
 
-The script does not need to live inside the folder where you want to save a course archive. A good setup is to keep the GitHub repo in a normal tools or projects folder, then choose the archive destination with `--out-dir`.
+The script does not need to live inside the folder where you want to save a course archive. A good setup is to keep the GitHub repo in a separate tools or projects folder, then choose the archive destination with `--out-dir`.
 
 For example:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/canvas-course-archiver.git
+git clone https://github.com/inkouper/canvas-course-archiver.git
 cd canvas-course-archiver
 ```
 
@@ -65,8 +66,6 @@ python canvas_archive.py \
 When `--out-dir` is provided, it is treated as a parent destination folder. The script creates a timestamped subfolder inside it, such as `course_archive_20260514_143012/`.
 
 If you omit `--out-dir`, the archive is created in the current working directory, using a timestamped folder name such as `canvas_archive_12345_20260514_143012/`.
-
-Keeping the script/repo separate from generated archive folders is recommended, especially if you plan to publish the code on GitHub. Archive outputs and `session.json` should stay private unless you intentionally choose to share them.
 
 ## How to Use
 
@@ -122,11 +121,11 @@ python canvas_archive.py --course-url https://canvas.example.edu/courses/12345 -
 
 This keeps reruns separate and avoids accidentally mixing an old archive with a new one.
 
-## Using An AI Assistant
+## Using An AI Assistant Environment
 
 You can use a local AI coding assistant, such as OpenAI Codex, Claude Cowork, or a similar tool, to help set up, run, inspect, and troubleshoot this project. The assistant should work in a local workspace where it can see `canvas_archive.py`, `README.md`, and `check_archive.py`.
 
-A good assistant workflow is:
+A suggested workflow is:
 
 1. Ask the assistant to inspect the project first:
 
@@ -208,7 +207,7 @@ If login stops working or you need to switch accounts, delete `session.json` and
 
 Use this before `--apply`, especially when archiving a large course.
 
-## Applying the Archive
+## Applying the Archiver
 
 `--apply` writes the archive to disk. After it finishes, check `manifest.json` for failures. A healthy run should have no failed module items and no failed course files.
 
@@ -258,14 +257,6 @@ print("module failures:", len(module_failures))
 print("course file failures:", len(file_failures))
 print("announcement failures:", len(announcement_failures))
 ```
-
-## Security And Privacy
-
-Do not commit archive outputs unless you are sure you have the right to share the course materials.
-
-Never commit `session.json`. It contains browser session state that may grant access to Canvas. The included `.gitignore` excludes common archive outputs, session files, and Python cache files.
-
-Also review archived HTML before sharing. Course pages may contain student names, assignment details, hidden comments, links, analytics IDs, or institution-specific markup.
 
 ## Limitations
 
